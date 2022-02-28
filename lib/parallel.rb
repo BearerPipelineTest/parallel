@@ -234,6 +234,17 @@ module Parallel
       map(0...count, options.merge(in_processes: count), &block)
     end
 
+    def in_ractors(options)
+      ractor = options[:ractor]
+      raise "pass the code you want to execute as `ractor: [ClassName, :method_name]`" if block_given? && !ractor
+      Array.new(options.fetch(:count)) do
+        Ractor.new do
+          klass, method_name = receive
+          klass.send(method_name)
+        end.send(ractor)
+      end.map(&:take)
+    end
+
     def each(array, options = {}, &block)
       map(array, options.merge(preserve_results: false), &block)
     end
@@ -264,6 +275,9 @@ module Parallel
       elsif options[:in_threads]
         method = :in_threads
         size = options[method]
+      elsif options[:in_ractors]
+        method = :in_ractors
+        size = options[method]
       else
         method = :in_processes
         if Process.respond_to?(:fork)
@@ -285,6 +299,8 @@ module Parallel
           work_direct(job_factory, options, &block)
         elsif method == :in_threads
           work_in_threads(job_factory, options.merge(count: size), &block)
+        elsif method == :in_ractors
+          work_in_ractors(job_factory, options.merge(count: size), &block)
         else
           work_in_processes(job_factory, options.merge(count: size), &block)
         end
@@ -371,6 +387,32 @@ module Parallel
             item, index = set
             result = with_instrumentation item, index, options do
               call_with_index(item, index, options, &block)
+            end
+            results_mutex.synchronize { results[index] = result }
+          rescue StandardError
+            exception = $!
+          end
+        end
+      end
+
+      exception || results
+    end
+
+    def work_in_ractors(job_factory, options, &block)
+      raise "interrupt_signal is no longer supported for threads" if options[:interrupt_signal]
+      results = []
+      results_mutex = Mutex.new # arrays are not thread-safe on jRuby
+      exception = nil
+
+      in_threads(options) do |worker_num|
+        self.worker_number = worker_num
+        # as long as there are more jobs, work on one of them
+        while !exception && set = job_factory.next
+          begin
+            item, index = set
+            result = with_instrumentation item, index, options do
+              # call_with_index(item, index, options, &block)
+              Ractor.new { Ractor.yield receive.call }.send(block).take
             end
             results_mutex.synchronize { results[index] = result }
           rescue StandardError
